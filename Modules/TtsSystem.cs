@@ -42,7 +42,6 @@ public sealed class TtsSystem : ModuleBase
     [
         ("播报文本", "/omni TtsSystem say {quick}"),
         ("停止播报", "/omni TtsSystem stop"),
-        ("播放测试", "/omni TtsSystem test"),
         ("清空队列", "/omni TtsSystem clear"),
         ("清除音频缓存", "/omni TtsSystem purge"),
     ];
@@ -264,7 +263,8 @@ public sealed class TtsSystem : ModuleBase
                 return true;
 
             case "test":
-                Speak(config.TestText);
+                // test 是快捷播报文本的试听别名，不再单独维护一份测试文本。
+                Speak(config.HotkeyText);
                 return true;
         }
 
@@ -334,7 +334,8 @@ public sealed class TtsSystem : ModuleBase
         ImGui.SameLine();
         if (ImGui.Button("测试播报"))
         {
-            Speak(config.TestText);
+            // 测试播报读的就是快捷播报文本，不再有独立的测试文本。
+            Speak(config.HotkeyText);
         }
 
         var engine = (int)config.Engine;
@@ -449,21 +450,6 @@ public sealed class TtsSystem : ModuleBase
             dirty = true;
         }
 
-        ImGui.Separator();
-
-        var testText = config.TestText;
-        if (LabeledInputText("测试文本", "##ttsTestText", ref testText, 256))
-        {
-            config.TestText = testText;
-            dirty = true;
-        }
-
-        ImGui.SameLine();
-        if (ImGui.Button("试听"))
-        {
-            Speak(config.TestText);
-        }
-
         if (config.Engine == TtsEngine.CustomCommand)
         {
             var exe = config.CustomExecutable;
@@ -535,9 +521,8 @@ public sealed class TtsSystem : ModuleBase
         {
             case 0: Speak(config.HotkeyText); break;
             case 1: Stop(); break;
-            case 2: Speak(config.TestText); break;
-            case 3: ClearQueue(); break;
-            case 4: PurgeCache(); break;
+            case 2: ClearQueue(); break;
+            case 3: PurgeCache(); break;
         }
     }
 
@@ -763,31 +748,30 @@ public sealed class TtsSystem : ModuleBase
         var format = PreferredFormats()[0];
         Task.Run(() =>
         {
-            foreach (var text in new[] { config.HotkeyText, config.TestText })
+            // 预热快捷播报文本，让首次触发也几乎不用等合成。
+            var text = config.HotkeyText;
+            if (disposed || string.IsNullOrWhiteSpace(text))
             {
-                if (disposed || string.IsNullOrWhiteSpace(text))
+                return;
+            }
+
+            var request = BuildRequest(text, format);
+            try
+            {
+                if (TtsEdgeClient.TryGetCached(request) is not null)
                 {
-                    continue;
+                    return;
                 }
 
-                var request = BuildRequest(text, format);
-                try
+                var audio = TtsEdgeClient.SynthesizeAsync(request).GetAwaiter().GetResult();
+                if (audio is { Length: > 0 })
                 {
-                    if (TtsEdgeClient.TryGetCached(request) is not null)
-                    {
-                        continue;
-                    }
-
-                    var audio = TtsEdgeClient.SynthesizeAsync(request).GetAwaiter().GetResult();
-                    if (audio is { Length: > 0 })
-                    {
-                        TtsEdgeClient.SaveToCache(request, audio);
-                    }
+                    TtsEdgeClient.SaveToCache(request, audio);
                 }
-                catch
-                {
-                    // 预热失败不影响后续正常合成。
-                }
+            }
+            catch
+            {
+                // 预热失败不影响后续正常合成。
             }
         });
     }
@@ -2007,8 +1991,6 @@ public sealed class TtsSystemConfig
 
     /// <summary>Edge TTS 失败（如断网）时回退到系统语音。</summary>
     public bool FallbackToSapi { get; set; } = true;
-
-    public string TestText { get; set; } = "语音测试";
 
     /// <summary>发音替换表，用于修正游戏专有名词的读法。</summary>
     public Dictionary<string, string> PhonemeReplacements { get; set; } = new()
