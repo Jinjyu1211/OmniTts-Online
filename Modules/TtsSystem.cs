@@ -71,10 +71,11 @@ public sealed class TtsSystem : ModuleBase
 
     public override bool HasSettings => true;
 
-    /// <summary>启用时后台预热连接与常用文本缓存。ModuleBase 提供该生命周期钩子。</summary>
+    /// <summary>启用时注册对外 IPC 端点，并后台预热连接与常用文本缓存。</summary>
     protected override void OnEnable()
     {
         Instance = this;
+        TtsIpc.Register();
         PreheatAsync();
         base.OnEnable();
     }
@@ -482,7 +483,8 @@ public sealed class TtsSystem : ModuleBase
 
         ImGui.TextUnformatted($"状态：{statusText}");
         ImGui.TextUnformatted(
-            $"诊断：NAudio={TtsEdgeClient.IsNaudioAvailable()}，上次格式={lastWorkingFormat ?? "无"}，日志={TtsEdgeClient.LogFilePath}");
+            $"诊断：NAudio={TtsEdgeClient.IsNaudioAvailable()}，上次格式={lastWorkingFormat ?? "无"}，IPC={TtsIpc.Status}");
+        ImGui.TextUnformatted($"日志：{TtsEdgeClient.LogFilePath}");
 
         return dirty;
     }
@@ -560,6 +562,7 @@ public sealed class TtsSystem : ModuleBase
 
         disposed = true;
         abortCurrent = true;
+        TtsIpc.Unregister();
 
         lock (gate)
         {
@@ -1932,6 +1935,260 @@ public static class TtsBridge
         }
 
         return false;
+    }
+}
+
+/// <summary>
+/// Dalamud IPC 提供端：让任意 Dalamud 插件（不限于 Omni 在线模块）都能调用本模块播报。
+///
+/// 全程反射实现：编译期只依赖宿主提供的 OmniToolbox.Common（OmniToolbox.Host.DalamudServices），
+/// 不新增 Dalamud.dll 的编译期引用，符合在线模块“依赖必须由宿主提供”的约束。
+///
+/// 对外端点（订阅方用同名 + 同签名订阅）：
+///   OmniTts.Version      Func&lt;int&gt;                              协议版本
+///   OmniTts.IsAvailable  Func&lt;bool&gt;                             模块已加载且启用
+///   OmniTts.Say          Func&lt;string, bool&gt;                     按当前配置播报
+///   OmniTts.SayEx        Func&lt;string, string, int, int, bool&gt;   文本/音色/语速/音量，音色为空或语速音量非正数表示沿用配置
+///   OmniTts.Stop         Action                                 停止播报并清空队列
+///   OmniTts.ClearQueue   Action                                 仅清空等待队列
+/// </summary>
+public static class TtsIpc
+{
+    /// <summary>IPC 协议版本，签名变更时递增，便于订阅方做兼容判断。</summary>
+    public const int Version = 1;
+
+    private const string NameVersion = "OmniTts.Version";
+    private const string NameAvailable = "OmniTts.IsAvailable";
+    private const string NameSay = "OmniTts.Say";
+    private const string NameSayEx = "OmniTts.SayEx";
+    private const string NameStop = "OmniTts.Stop";
+    private const string NameClearQueue = "OmniTts.ClearQueue";
+
+    /// <summary>持有已注册的 provider，用于注销端点。</summary>
+    private static readonly List<object> providers = [];
+
+    /// <summary>持有委托实例，避免被调用方 GC 回收导致 IPC 失效。</summary>
+    private static readonly List<object> keepAlive = [];
+
+    private static bool registered;
+
+    /// <summary>注册失败原因，成功时为空；设置页与 diag 命令会显示。</summary>
+    private static string lastError = "尚未注册";
+
+    public static bool Registered => registered;
+
+    /// <summary>一行状态，供设置页显示。</summary>
+    public static string Status =>
+        registered ? $"已注册 {providers.Count} 个端点" : $"未注册（{lastError}）";
+
+    /// <summary>注册全部 IPC 端点。幂等：已注册时直接返回。</summary>
+    public static void Register()
+    {
+        if (registered)
+        {
+            return;
+        }
+
+        var pluginInterface = ResolvePluginInterface();
+        if (pluginInterface is null)
+        {
+            lastError = "宿主未暴露 DalamudServices.PluginInterface";
+            return;
+        }
+
+        try
+        {
+            RegisterFunc(pluginInterface, [typeof(int)], NameVersion, (Func<int>)(() => Version));
+
+            RegisterFunc(pluginInterface, [typeof(bool)], NameAvailable,
+                (Func<bool>)(() => TtsSystem.Instance is { IsEnabled: true }));
+
+            RegisterFunc(pluginInterface, [typeof(string), typeof(bool)], NameSay,
+                (Func<string, bool>)(text => TtsSystem.Say(text)));
+
+            RegisterFunc(pluginInterface,
+                [typeof(string), typeof(string), typeof(int), typeof(int), typeof(bool)], NameSayEx,
+                (Func<string, string, int, int, bool>)((text, voice, speed, volume) =>
+                {
+                    var instance = TtsSystem.Instance;
+                    if (instance is null)
+                    {
+                        return false;
+                    }
+
+                    return instance.Speak(
+                        text,
+                        string.IsNullOrWhiteSpace(voice) ? null : voice,
+                        speed > 0 ? speed : (int?)null,
+                        volume > 0 ? volume : (int?)null);
+                }));
+
+            RegisterAction(pluginInterface, NameStop, () => TtsSystem.Instance?.Stop());
+            RegisterAction(pluginInterface, NameClearQueue, () => TtsSystem.Instance?.ClearQueue());
+
+            registered = true;
+            lastError = string.Empty;
+        }
+        catch (Exception ex)
+        {
+            lastError = ex.Message;
+            Unregister();
+        }
+    }
+
+    /// <summary>注销全部端点。模块释放时调用，避免残留旧程序集的注册。</summary>
+    public static void Unregister()
+    {
+        for (var i = 0; i < providers.Count; i++)
+        {
+            var provider = providers[i];
+            if (provider is null)
+            {
+                continue;
+            }
+
+            // 同一 provider 上只有一个端点，两种注销都调一次，不存在的方法返回 null 直接跳过。
+            try
+            {
+                provider.GetType().GetMethod("UnregisterFunc")?.Invoke(provider, null);
+            }
+            catch
+            {
+                // 忽略：未注册 func 时注销会抛异常。
+            }
+
+            try
+            {
+                provider.GetType().GetMethod("UnregisterAction")?.Invoke(provider, null);
+            }
+            catch
+            {
+                // 忽略：未注册 action 时注销会抛异常。
+            }
+        }
+
+        providers.Clear();
+        keepAlive.Clear();
+        registered = false;
+    }
+
+    /// <summary>取宿主的 Dalamud 插件接口，取不到返回 null。</summary>
+    private static object? ResolvePluginInterface()
+    {
+        try
+        {
+            var services = typeof(global::OmniToolbox.Host.DalamudServices);
+            var property = services.GetProperty(
+                "PluginInterface",
+                System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+            return property?.GetValue(null);
+        }
+        catch (Exception ex)
+        {
+            lastError = ex.Message;
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// 注册一个带返回值的端点：先注销同名旧端点（模块重载后旧程序集的注册可能残留），再注册。
+    /// genericArgs 为 GetIpcProvider 的泛型参数，最后一个是返回类型。
+    /// </summary>
+    private static void RegisterFunc(object pluginInterface, Type[] genericArgs, string name, Delegate func)
+    {
+        var provider = GetProvider(pluginInterface, genericArgs, name);
+        if (provider is null)
+        {
+            throw new InvalidOperationException($"找不到 {name} 对应的 GetIpcProvider 重载");
+        }
+
+        try
+        {
+            provider.GetType().GetMethod("UnregisterFunc")?.Invoke(provider, null);
+        }
+        catch
+        {
+            // 忽略：首次注册时没有旧端点。
+        }
+
+        var register = provider.GetType().GetMethod("RegisterFunc");
+        if (register is null)
+        {
+            throw new InvalidOperationException($"{name} 的 provider 没有 RegisterFunc");
+        }
+
+        register.Invoke(provider, [func]);
+        providers.Add(provider);
+        keepAlive.Add(func);
+    }
+
+    /// <summary>注册一个无返回值端点，用 ICallGateProvider&lt;object&gt; 承载 Action。</summary>
+    private static void RegisterAction(object pluginInterface, string name, Action action)
+    {
+        var provider = GetProvider(pluginInterface, [typeof(object)], name);
+        if (provider is null)
+        {
+            throw new InvalidOperationException($"找不到 {name} 对应的 GetIpcProvider 重载");
+        }
+
+        try
+        {
+            provider.GetType().GetMethod("UnregisterAction")?.Invoke(provider, null);
+        }
+        catch
+        {
+            // 忽略：首次注册时没有旧端点。
+        }
+
+        var register = provider.GetType().GetMethod("RegisterAction");
+        if (register is null)
+        {
+            throw new InvalidOperationException($"{name} 的 provider 没有 RegisterAction");
+        }
+
+        register.Invoke(provider, [action]);
+        providers.Add(provider);
+        keepAlive.Add(action);
+    }
+
+    /// <summary>按泛型参数个数匹配 GetIpcProvider 的正确重载并返回 provider 实例。</summary>
+    private static object? GetProvider(object pluginInterface, Type[] genericArgs, string name)
+    {
+        var methods = pluginInterface.GetType().GetMethods();
+        foreach (var method in methods)
+        {
+            if (!string.Equals(method.Name, "GetIpcProvider", StringComparison.Ordinal)
+                || !method.IsGenericMethodDefinition
+                || method.GetGenericArguments().Length != genericArgs.Length)
+            {
+                continue;
+            }
+
+            return method.MakeGenericMethod(genericArgs).Invoke(pluginInterface, [name]);
+        }
+
+        // 显式接口实现时公开方法里找不到，退回到接口本身再找一次。
+        foreach (var contract in pluginInterface.GetType().GetInterfaces())
+        {
+            if (!string.Equals(contract.Name, "IDalamudPluginInterface", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            foreach (var method in contract.GetMethods())
+            {
+                if (!string.Equals(method.Name, "GetIpcProvider", StringComparison.Ordinal)
+                    || !method.IsGenericMethodDefinition
+                    || method.GetGenericArguments().Length != genericArgs.Length)
+                {
+                    continue;
+                }
+
+                return method.MakeGenericMethod(genericArgs).Invoke(pluginInterface, [name]);
+            }
+        }
+
+        return null;
     }
 }
 
