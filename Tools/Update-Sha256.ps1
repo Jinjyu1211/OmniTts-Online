@@ -32,20 +32,22 @@ $manifest = Read-Utf8 $manifestPath | ConvertFrom-Json
 $text = Read-Utf8 $manifestPath
 
 foreach ($module in $manifest.Modules) {
-    if ($module.File -match '^https?://') {
-        Write-Warning "模块 $($module.InternalName) 使用完整下载地址，需手动下载该文件后计算摘要，已跳过。"
-        continue
-    }
-
-    $file = Join-Path $root $module.File
-    if (-not (Test-Path -LiteralPath $file)) {
-        throw "找不到模块文件：$file"
-    }
-
-    $actual = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash
-    $oldSha = $module.Sha256
     $oldVersion = $module.Version
     $newVersion = $oldVersion
+
+    # 完整下载地址（jsDelivr 直链）拆成「CDN 前缀 + 仓库内相对路径」，
+    # 形如 https://cdn.jsdelivr.net/gh/<owner>/<repo>@<ref>/Modules/<ver>/X.cs
+    $relative = $module.File
+    $prefix = ''
+    if ($relative -match '^(?<prefix>https?://.*?@[^/]+/)(?<rest>.+)$') {
+        $prefix = $Matches['prefix']
+        $relative = $Matches['rest']
+    }
+
+    $currentFile = Join-Path $root $relative
+    if (-not (Test-Path -LiteralPath $currentFile)) {
+        throw "找不到模块文件：$currentFile"
+    }
 
     if ($BumpVersion) {
         $parts = $oldVersion.Split('.')
@@ -53,18 +55,32 @@ foreach ($module in $manifest.Modules) {
         $newVersion = $parts -join '.'
     }
 
-    # 文本替换：只改这两个值，保留清单原有缩进与编码。
+    $targetRelative = $relative
+    if ($newVersion -ne $oldVersion) {
+        # 版本号目录化：Modules/<version>/<file>.cs。
+        # 每个版本的下载地址都不同，CDN / 代理不可能返回上一版的缓存内容，
+        # 从根上避免「清单已更新但下载到旧文件导致摘要校验失败」。
+        $leaf = [System.IO.Path]::GetFileName($relative)
+        $targetRelative = ('Modules/{0}/{1}' -f $newVersion, $leaf)
+        $targetFile = Join-Path $root $targetRelative
+        $targetDir = Split-Path -Parent $targetFile
+        if (-not (Test-Path -LiteralPath $targetDir)) {
+            New-Item -ItemType Directory -Path $targetDir | Out-Null
+        }
+        Copy-Item -LiteralPath $currentFile -Destination $targetFile -Force
+        Write-Host ("已生成版本快照：{0}" -f $targetRelative)
+
+        # 文本替换：只改这两处，保留清单原有缩进与编码。
+        $text = $text.Replace(('"File": "{0}"' -f $module.File), ('"File": "{0}"' -f ($prefix + $targetRelative)))
+        $text = $text.Replace(('"Version": "{0}"' -f $oldVersion), ('"Version": "{0}"' -f $newVersion))
+    }
+
+    $actual = (Get-FileHash -LiteralPath (Join-Path $root $targetRelative) -Algorithm SHA256).Hash
     $text = [regex]::Replace(
         $text,
-        [regex]::Escape($oldSha),
+        [regex]::Escape($module.Sha256),
         $actual,
         [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-
-    if ($newVersion -ne $oldVersion) {
-        $text = $text.Replace(
-            ('"Version": "{0}"' -f $oldVersion),
-            ('"Version": "{0}"' -f $newVersion))
-    }
 
     Write-Host ("{0,-24} {1}  {2}" -f $module.InternalName, $newVersion, $actual)
 }

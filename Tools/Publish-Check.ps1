@@ -65,18 +65,28 @@ foreach ($m in $manifest.Modules) {
         Add-Error "$name：Version「$($m.Version)」不是 2–4 段非负整数"
     }
 
-    # File：相对路径，扩展名小写
-    if ($m.File -match '^https?://') {
-        Add-Warning "$name：File 使用完整下载地址，本脚本无法本地校验摘要，需手动下载后比对"
-        continue
+    # File：可以是相对路径，也可以是完整下载地址（jsDelivr 等 CDN 直链）。
+    # 完整地址形如 https://cdn.jsdelivr.net/gh/<owner>/<repo>@<ref>/Modules/<ver>/X.cs，
+    # 取 "@<ref>/" 之后的部分即可映射回仓库内的相对路径，从而照常做本地校验。
+    $relativeFile = $m.File
+    if ($relativeFile -match '^https?://') {
+        Add-Warning "$name：File 使用完整下载地址（校验的是其映射回仓库的本地副本）"
+        if ($relativeFile -match '@[^/]+/(.+)$') {
+            $relativeFile = $Matches[1]
+            Write-Host ("  映射本地文件  : {0}" -f $relativeFile)
+        }
+        else {
+            Add-Error "$name：无法从下载地址推断仓库内相对路径，跳过本地校验"
+            continue
+        }
     }
 
-    $ext = [System.IO.Path]::GetExtension($m.File)
+    $ext = [System.IO.Path]::GetExtension($relativeFile)
     if ($ext -notin @('.cs', '.dll')) {
         Add-Error "$name：File 扩展名必须是小写 .cs 或 .dll，当前为 $ext"
     }
 
-    $file = Join-Path $root $m.File
+    $file = Join-Path $root $relativeFile
     if (-not (Test-Path -LiteralPath $file)) {
         Add-Error "$name：找不到文件 $file"
         continue
