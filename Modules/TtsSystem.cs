@@ -44,6 +44,7 @@ public sealed class TtsSystem : ModuleBase
         ("停止播报", "/omni TtsSystem stop"),
         ("清空队列", "/omni TtsSystem clear"),
         ("清除音频缓存", "/omni TtsSystem purge"),
+        ("重置网络连接", "/omni TtsSystem reset"),
     ];
 
     private TtsSystemConfig config = new();
@@ -263,6 +264,13 @@ public sealed class TtsSystem : ModuleBase
                 PurgeCache();
                 return true;
 
+            case "reset":
+                // 服务端限流进入冷却后，可用这条命令立刻恢复，不必等待冷却结束。
+                TtsEdgeClient.ResetHealth();
+                statusText = "已重置 Edge 连接与限流冷却";
+                PreheatAsync();
+                return true;
+
             case "test":
                 // test 是快捷播报文本的试听别名，不再单独维护一份测试文本。
                 Speak(config.HotkeyText);
@@ -397,6 +405,13 @@ public sealed class TtsSystem : ModuleBase
                 config.FallbackToSapi = fallback;
                 dirty = true;
             }
+
+            var retries = config.EdgeRetries;
+            if (LabeledSliderInt("合成重试次数（失败后重建连接再试）", "##ttsRetries", ref retries, 0, 3))
+            {
+                config.EdgeRetries = retries;
+                dirty = true;
+            }
         }
 
         var volume = config.Volume;
@@ -484,6 +499,12 @@ public sealed class TtsSystem : ModuleBase
         ImGui.TextUnformatted($"状态：{statusText}");
         ImGui.TextUnformatted(
             $"诊断：NAudio={TtsEdgeClient.IsNaudioAvailable()}，上次格式={lastWorkingFormat ?? "无"}，IPC={TtsIpc.Status}");
+
+        var cooling = TtsEdgeClient.CooldownRemainingSeconds;
+        ImGui.TextUnformatted(cooling > 0
+            ? $"Edge：连续失败 {TtsEdgeClient.ConsecutiveFailures} 次，限流冷却剩余 {cooling}s（点上方“重置网络连接”提前恢复）"
+            : $"Edge：连接正常，连续失败 {TtsEdgeClient.ConsecutiveFailures} 次");
+
         ImGui.TextUnformatted($"日志：{TtsEdgeClient.LogFilePath}");
 
         return dirty;
@@ -525,6 +546,11 @@ public sealed class TtsSystem : ModuleBase
             case 1: Stop(); break;
             case 2: ClearQueue(); break;
             case 3: PurgeCache(); break;
+            case 4:
+                TtsEdgeClient.ResetHealth();
+                statusText = "已重置 Edge 连接与限流冷却";
+                PreheatAsync();
+                break;
         }
     }
 
@@ -717,15 +743,19 @@ public sealed class TtsSystem : ModuleBase
 
     private string[] PreferredFormats()
     {
-        var preferred = config.AudioFormat switch
-        {
-            1 => "wav",
-            _ => lastWorkingFormat ?? "mp3",
-        };
+        // AudioFormat == 1 是用户强制指定 WAV，其余情况以上次成功的格式优先、默认 MP3。
+        var preferred = config.AudioFormat == 1 ? "wav" : lastWorkingFormat ?? "mp3";
+        var order = string.Equals(preferred, "mp3", StringComparison.OrdinalIgnoreCase)
+            ? new[] { "mp3", "wav" }
+            : new[] { "wav", "mp3" };
 
-        return string.Equals(preferred, "mp3", StringComparison.OrdinalIgnoreCase)
-            ? ["mp3", "wav"]
-            : ["wav", "mp3"];
+        // 服务端已确认不下发 WAV 时跳过它：一次空请求同样占用限流配额。
+        if (TtsEdgeClient.WavUnsupported)
+        {
+            order = config.AudioFormat == 1 ? order : ["mp3"];
+        }
+
+        return order;
     }
 
     /// <summary>已验证可用的格式，避免每次失败都重新合成一遍另一种格式。</summary>
@@ -797,6 +827,8 @@ public sealed class TtsSystem : ModuleBase
 
         try
         {
+            TtsEdgeClient.MaxRetries = config.EdgeRetries;
+
             var request = BuildRequest(text, format);
 
             var cached = config.CacheAudio ? TtsEdgeClient.TryGetCached(request) : null;
@@ -813,9 +845,12 @@ public sealed class TtsSystem : ModuleBase
                 LogEdge($"合成 {format} 耗时 {sw.ElapsedMilliseconds}ms -> {(audio is { Length: > 0 } ? audio.Length + "B" : "空音频")}");
                 if (audio is null || audio.Length == 0)
                 {
-                    lastEdgeError = string.Equals(format, "wav", StringComparison.OrdinalIgnoreCase)
-                        ? "服务端不支持 WAV（返回空音频）"
-                        : "服务端返回空音频（可能被限流，稍后再试）";
+                    var cooling = TtsEdgeClient.CooldownRemainingSeconds;
+                    lastEdgeError = cooling > 0
+                        ? $"服务端限流，冷却 {cooling}s（可用 reset 命令提前恢复）"
+                        : string.Equals(format, "wav", StringComparison.OrdinalIgnoreCase)
+                            ? "服务端不支持 WAV（返回空音频）"
+                            : "服务端返回空音频（可能被限流，稍后再试）";
                     LogEdge(lastEdgeError);
                     return SpeakOutcome.SynthFailed;
                 }
@@ -1124,15 +1159,69 @@ public static class TtsEdgeClient
     private const string SecGecVersion = "1-134.0.3124.66";
     private const string WssUrl =
         "wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1?TrustedClientToken=" + TrustedClientToken;
-    private const int TimeoutMs = 10000;
+    // 游戏进程常走加速器/代理，握手可能明显慢于直连，因此握手超时放宽到 12 秒。
+    private const int HandshakeTimeoutMs = 12000;
+    private const int SynthesisTimeoutMs = 12000;
+
+    // 复用连接正常时 0.5 秒左右就返回，给 6 秒足够；超时说明连接已被服务端静默断开，
+    // 早点放弃转新建，比干等 12 秒更快恢复。
+    private const int PooledTimeoutMs = 6000;
+
+    // 单次播报的总耗时预算：超时后不再重试，直接让上层回退系统语音，避免界面长时间卡在"合成中"。
+    private const int TotalBudgetMs = 20000;
+
     private const int BufferSize = 4096;
 
-    // 复用的连接最长存活时间，超时后下次使用时重建，避免服务端静默断开。
-    private const int PooledLifetimeSeconds = 240;
+    // 复用的连接最长存活时间。服务端会静默断开长时间空闲的连接，
+    // 超过寿命就主动重建，避免"复用了一个已经死掉的连接"白白浪费一次尝试。
+    private const int PooledLifetimeSeconds = 90;
+
+    // 单条连接最多复用的次数：免费端点在若干次请求后会限流并关闭连接，
+    // 提前重建比等到失败再重建更稳。
+    private const int MaxPooledUses = 8;
+
+    // 连续失败进入冷却的阈值与时长上限：冷却期内不再打服务端，
+    // 直接快速失败让上层回退系统语音，避免因重试加重限流。
+    private const int CooldownThreshold = 2;
+    private const int MaxCooldownSeconds = 120;
 
     private static readonly SemaphoreSlim SynthesisGate = new(1, 1);
     private static WebSocket? pooledSocket;
     private static DateTimeOffset pooledSince;
+    private static int pooledUses;
+
+    private static int consecutiveFailures;
+    private static DateTimeOffset cooldownUntil;
+
+    /// <summary>服务端确认不下发 WAV（返回空音频）后置位，之后跳过 WAV 避免浪费请求配额。</summary>
+    private static volatile bool wavUnsupported;
+
+    /// <summary>单条播报的合成重试次数（不含首次尝试），0 表示不重试。设置页可调。</summary>
+    public static int MaxRetries { get; set; } = 2;
+
+    /// <summary>连续失败次数，用于界面诊断。</summary>
+    public static int ConsecutiveFailures => Volatile.Read(ref consecutiveFailures);
+
+    /// <summary>冷却剩余秒数，0 表示未冷却。</summary>
+    public static int CooldownRemainingSeconds
+    {
+        get
+        {
+            var left = (int)(cooldownUntil - DateTimeOffset.UtcNow).TotalSeconds;
+            return left > 0 ? left : 0;
+        }
+    }
+
+    /// <summary>WAV 是否已被确认不可用。</summary>
+    public static bool WavUnsupported => wavUnsupported;
+
+    /// <summary>清除冷却与失败计数，并丢弃当前连接，用于界面上的"重置连接"。</summary>
+    public static void ResetHealth()
+    {
+        Volatile.Write(ref consecutiveFailures, 0);
+        cooldownUntil = default;
+        CloseConnection();
+    }
 
     // WAV 可由 winmm 的 PlaySound 直接播放，无需任何解码器与第三方库，因此作为默认格式。
     private const string OutputWav = "riff-24khz-16bit-mono-pcm";
@@ -1277,52 +1366,131 @@ public static class TtsEdgeClient
         }
     }
 
-    /// <summary>合成语音，返回音频字节；失败返回 null。</summary>
+    /// <summary>
+    /// 合成语音，返回音频字节；失败返回 null。
+    /// 免费端点会限流，且连接可能被服务端静默关闭，因此这里做多轮尝试：
+    /// 首次优先复用连接（跳过握手），失败后再新建连接重试，重试之间指数退避。
+    /// 连续失败到达阈值后进入冷却，冷却期内直接返回 null 让上层快速回退。
+    /// </summary>
     public static async Task<byte[]?> SynthesizeAsync(TtsEdgeRequest request, CancellationToken cancellationToken = default)
     {
+        var cooling = CooldownRemainingSeconds;
+        if (cooling > 0)
+        {
+            TtsSystem.LogEdge($"冷却中（剩余 {cooling}s），跳过网络请求");
+            return null;
+        }
+
         await SynthesisGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            // 复用已有连接：单次握手约 0.7–1.3 秒，占整体耗时一半以上，跳过握手能显著缩短首字音延迟。
-            if (TryTakePooled(out var pooled))
+            var attempts = Math.Clamp(MaxRetries, 0, 3) + 1;
+            var budget = Stopwatch.StartNew();
+            var isWav = !string.Equals(request.OutputFormat, "mp3", StringComparison.OrdinalIgnoreCase);
+
+            for (var attempt = 0; attempt < attempts; attempt++)
             {
-                TtsSystem.LogEdge("复用连接开始合成");
-                try
+                if (cancellationToken.IsCancellationRequested)
                 {
-                    var reused = await SynthesizeOnAsync(pooled!, request, cancellationToken).ConfigureAwait(false);
-                    if (reused is { Length: > 0 })
+                    return null;
+                }
+
+                if (attempt > 0 && budget.ElapsedMilliseconds > TotalBudgetMs)
+                {
+                    TtsSystem.LogEdge($"已耗时 {budget.ElapsedMilliseconds}ms 超过预算，停止重试");
+                    break;
+                }
+
+                // 首次尝试复用已有连接：握手约 0.7–1.3 秒，占整体耗时一半以上。
+                if (attempt == 0 && TryTakePooled(out var pooled))
+                {
+                    TtsSystem.LogEdge("复用连接开始合成");
+                    try
                     {
-                        pooledSince = DateTimeOffset.UtcNow;
-                        return reused;
+                        var reused = await SynthesizeOnAsync(
+                            pooled!, request, WithTimeout(cancellationToken, PooledTimeoutMs, out var pooledCts))
+                            .ConfigureAwait(false);
+                        pooledCts.Dispose();
+
+                        if (reused is { Length: > 0 })
+                        {
+                            MarkSuccess();
+                            return reused;
+                        }
+
+                        TtsSystem.LogEdge("复用连接返回空音频");
+                    }
+                    catch (Exception ex)
+                    {
+                        TtsSystem.LogEdge($"复用连接失败 {ex.GetType().Name}: {ex.Message}，转新建");
                     }
 
-                    TtsSystem.LogEdge("复用连接返回空音频");
+                    DropSocket(pooled!);
+                    pooledSocket = null;
+                    continue;
+                }
+
+                // 重试前退避，避免短时间内连续打服务端加重限流。
+                if (attempt > 0)
+                {
+                    var backoff = attempt * 400;
+                    TtsSystem.LogEdge($"退避 {backoff}ms 后重试（第 {attempt + 1} 次尝试）");
+                    await Task.Delay(backoff, cancellationToken).ConfigureAwait(false);
+                }
+
+                TtsSystem.LogEdge("新建连接…");
+                WebSocket? ws = null;
+                try
+                {
+                    var token = WithTimeout(cancellationToken, HandshakeTimeoutMs, out var handshakeCts);
+                    var sw = Stopwatch.StartNew();
+                    ws = await ConnectAsync(token).ConfigureAwait(false);
+                    handshakeCts.Dispose();
+                    TtsSystem.LogEdge($"握手完成 {sw.ElapsedMilliseconds}ms");
+
+                    var synthToken = WithTimeout(cancellationToken, SynthesisTimeoutMs, out var synthCts);
+                    var audio = await SynthesizeOnAsync(ws, request, synthToken).ConfigureAwait(false);
+                    synthCts.Dispose();
+
+                    if (audio is { Length: > 0 })
+                    {
+                        // 缓存池里放新连接，供下一次复用。
+                        if (pooledSocket is not null)
+                        {
+                            DropSocket(pooledSocket);
+                        }
+
+                        pooledSocket = ws;
+                        pooledSince = DateTimeOffset.UtcNow;
+                        pooledUses = 0;
+                        ws = null;
+                        MarkSuccess();
+                        return audio;
+                    }
+
+                    TtsSystem.LogEdge("新建连接返回空音频");
                 }
                 catch (Exception ex)
                 {
-                    TtsSystem.LogEdge($"复用连接失败 {ex.GetType().Name}: {ex.Message}，转新建");
+                    TtsSystem.LogEdge($"新建连接失败 {ex.GetType().Name}: {ex.Message}");
                 }
-
-                DropSocket(pooled!);
+                finally
+                {
+                    // 走到这里说明这条连接没被收进池子，必须关掉。
+                    if (ws is not null)
+                    {
+                        DropSocket(ws);
+                    }
+                }
             }
 
-            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            timeoutCts.CancelAfter(TimeoutMs);
-
-            TtsSystem.LogEdge("新建连接…");
-            var sw = Stopwatch.StartNew();
-            var ws = await ConnectAsync(timeoutCts.Token).ConfigureAwait(false);
-            TtsSystem.LogEdge($"握手完成 {sw.ElapsedMilliseconds}ms");
-            var audio = await SynthesizeOnAsync(ws, request, timeoutCts.Token).ConfigureAwait(false);
-            if (audio is { Length: > 0 })
+            if (isWav)
             {
-                pooledSocket = ws;
-                pooledSince = DateTimeOffset.UtcNow;
-                return audio;
+                // 服务端对 WAV 请求返回空音频是稳定行为，记下来以后别再浪费配额。
+                wavUnsupported = true;
             }
 
-            TtsSystem.LogEdge("新建连接返回空音频");
-            DropSocket(ws);
+            MarkFailure();
             return null;
         }
         finally
@@ -1331,9 +1499,44 @@ public static class TtsEdgeClient
         }
     }
 
+    /// <summary>在外部取消令牌之上叠加一个超时令牌，返回链接后的令牌，源对象通过 out 传出以便释放。</summary>
+    private static CancellationToken WithTimeout(CancellationToken outer, int milliseconds, out CancellationTokenSource cts)
+    {
+        cts = CancellationTokenSource.CreateLinkedTokenSource(outer);
+        cts.CancelAfter(milliseconds);
+        return cts.Token;
+    }
+
+    /// <summary>成功一次即清除失败计数与冷却。</summary>
+    private static void MarkSuccess()
+    {
+        Volatile.Write(ref consecutiveFailures, 0);
+        cooldownUntil = default;
+    }
+
+    /// <summary>累加失败次数，达到阈值后按失败轮次递增冷却时长。</summary>
+    private static void MarkFailure()
+    {
+        var failures = Interlocked.Increment(ref consecutiveFailures);
+        if (failures < CooldownThreshold)
+        {
+            return;
+        }
+
+        var seconds = Math.Min(MaxCooldownSeconds, 20 * (failures - CooldownThreshold + 1));
+        cooldownUntil = DateTimeOffset.UtcNow.AddSeconds(seconds);
+        TtsSystem.LogEdge($"连续失败 {failures} 次，进入冷却 {seconds}s");
+    }
+
     /// <summary>后台预热连接，让首次播报不必等待握手。重复调用无副作用。</summary>
     public static void WarmUp()
     {
+        // 冷却期内不预热，否则会打断退避节奏、延长限流恢复时间。
+        if (CooldownRemainingSeconds > 0)
+        {
+            return;
+        }
+
         Task.Run(async () =>
         {
             try
@@ -1346,9 +1549,10 @@ public static class TtsEdgeClient
                         return;
                     }
 
-                    using var cts = new CancellationTokenSource(TimeoutMs);
+                    using var cts = new CancellationTokenSource(HandshakeTimeoutMs);
                     pooledSocket = await ConnectAsync(cts.Token).ConfigureAwait(false);
                     pooledSince = DateTimeOffset.UtcNow;
+                    pooledUses = 0;
                 }
                 finally
                 {
@@ -1397,6 +1601,7 @@ public static class TtsEdgeClient
         }
 
         if (pooled.State != WebSocketState.Open ||
+            pooledUses >= MaxPooledUses ||
             DateTimeOffset.UtcNow - pooledSince > TimeSpan.FromSeconds(PooledLifetimeSeconds))
         {
             DropSocket(pooled);
@@ -1404,6 +1609,7 @@ public static class TtsEdgeClient
             return false;
         }
 
+        pooledUses++;
         socket = pooled;
         return true;
     }
@@ -2248,6 +2454,12 @@ public sealed class TtsSystemConfig
 
     /// <summary>Edge TTS 失败（如断网）时回退到系统语音。</summary>
     public bool FallbackToSapi { get; set; } = true;
+
+    /// <summary>
+    /// 单次播报的合成重试次数（不含首次尝试），0 表示不重试。
+    /// 免费端点会限流与被静默断连，重试能显著提高成功率；冷却期内不会重试。
+    /// </summary>
+    public int EdgeRetries { get; set; } = 2;
 
     /// <summary>发音替换表，用于修正游戏专有名词的读法。</summary>
     public Dictionary<string, string> PhonemeReplacements { get; set; } = new()
