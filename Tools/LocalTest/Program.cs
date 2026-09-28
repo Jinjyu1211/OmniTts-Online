@@ -5,7 +5,7 @@ using OmniToolbox.TreeHouseOnline;
 
 // 本地测试入口，编译的是仓库里的 Modules/TtsSystem.cs 本体。
 //
-//   OmniTtsLocalTest                                  播报默认测试文本
+//   OmniTtsLocalTest                                  播报默认快捷播报文本
 //   OmniTtsLocalTest say <文本> [--wav|--mp3] [--voice 短名] [--speed n] [--volume n] [--wait 秒]
 //   OmniTtsLocalTest synth <文本> [wav|mp3]           只合成并保存，不播放
 //   OmniTtsLocalTest diag                             检测本机播放链路（NAudio / MCI / WAV）
@@ -25,7 +25,7 @@ var module = new TtsSystem();
 
 if (cli.Length == 0)
 {
-    Speak(module, module.Config.TestText, 15);
+    Speak(module, module.Config.HotkeyText, 15);
     return;
 }
 
@@ -33,7 +33,7 @@ switch (cli[0].ToLowerInvariant())
 {
     case "say":
     {
-        var text = ArgValue(cli, 0) ?? module.Config.TestText;
+        var text = ArgValue(cli, 0) ?? module.Config.HotkeyText;
         var config = module.Config;
 
         if (Has(cli, "--mp3")) config.AudioFormat = 2;
@@ -52,7 +52,7 @@ switch (cli[0].ToLowerInvariant())
 
     case "synth":
     {
-        var text = cli.Length > 1 ? cli[1] : module.Config.TestText;
+        var text = cli.Length > 1 ? cli[1] : module.Config.HotkeyText;
         var format = cli.Length > 2 ? cli[2] : "mp3";
 
         Console.WriteLine($"合成中… 文本=「{text}」 格式={format}");
