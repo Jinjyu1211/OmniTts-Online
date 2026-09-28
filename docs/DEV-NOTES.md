@@ -252,7 +252,9 @@ ImGui.Checkbox(string label, ref bool v);
 ### 首次发布
 
 1. **建公开仓库**：在线模块只支持**公开**仓库中的 `.cs` / `.dll`，不支持私有仓库、Release 附件或 ZIP。
-2. **提交目录结构**：根目录 `TreeHouseModules.json` + `Modules/TtsSystem.cs`（`Tools/` 只是本地工具，不会被下载）。
+2. **提交目录结构**：根目录 `TreeHouseModules.json` + `Modules/TtsSystem.cs`（开发用的唯一源文件），
+   外加每个版本一份不可变快照 `Modules/<version>/TtsSystem.cs`（`Tools/` 只是本地工具，不会被下载）。
+   清单里的 `File` 指向**版本快照**，而不是开发中的源文件。
 3. **重算摘要**（改过代码就跑）：
 
    ```powershell
@@ -267,11 +269,12 @@ ImGui.Checkbox(string label, ref bool v);
 
 5. **推送**，然后在 Omni 里「插件设置 → 在线模块」填写仓库地址（或清单的 raw 地址），手动刷新。
 6. **启用**：首次安装默认关闭，到「树树妙妙屋 → 在线」手动启用。
-7. **远端复核**：本地一致不等于远端一致（Git 会转换换行符）。下载 `File` 指向的 raw 文件再算一次 SHA256 比对：
+7. **远端复核**：本地一致不等于远端一致（Git 会转换换行符、CDN 可能缓存旧内容）。
+   下载清单里 `File` 指向的地址再算一次 SHA256 比对：
 
    ```powershell
    $raw = "$env:TEMP\TtsSystem.cs"
-   Invoke-WebRequest 'https://raw.githubusercontent.com/Jinjyu1211/OmniTts-Online/main/Modules/TtsSystem.cs' -OutFile $raw
+   Invoke-WebRequest (ConvertFrom-Json (Get-Content TreeHouseModules.json -Raw -Encoding UTF8)).Modules[0].File -OutFile $raw
    (Get-FileHash -LiteralPath $raw -Algorithm SHA256).Hash
    ```
 
@@ -282,14 +285,38 @@ pwsh -File Tools/Update-Sha256.ps1 -BumpVersion
 ```
 
 脚本会重算摘要**并递增版本**；只改摘要不提版本不会触发已安装模块更新。
+递增版本时它还会把 `Modules/TtsSystem.cs` 复制成新目录 `Modules/<新版本>/TtsSystem.cs`，
+并把清单的 `File` 指到这份新快照，因此**每个版本的下载地址都不同**，CDN / 代理不可能返回上一版的缓存。
 改完再跑一次 `Publish-Check.ps1`，然后一起提交清单与模块文件。
 
 校验一致只说明文件与清单相符，不代表代码安全或作者可信。
 
+### 排查「清单已更新，但游戏里点更新失败」
+
+日志里 Omni 只给一句 `Online TreeHouse module operation failed.`，要看紧跟其后的异常：
+
+- **先判定是不是我们的问题**：打开游戏内的 `pluginConfigs/OmniToolbox/TreeHouseOnline/repositories.json`，
+  看仓库条目下的 `Modules[0].Version` / `Sha256` 是否与远端清单一致。
+  一致就说明**清单已成功拉取**，问题在下载模块文件或后续环节，与摘要、格式无关。
+- **`HttpRequestException: The SSL connection could not be established`
+  / `Received an unexpected EOF or 0 bytes from the transport stream`**：
+  这是下载被掐断，几乎都是网络。同一时刻 Dalamud 的 `[PluginRepository]` 若也成片报
+  `仓库数据获取失败`，即可确认是全局网络/代理抽风，而不是本仓库。
+- 定位时可直接对比两个下载源的成率，别只看单次能否打开网页：
+
+  ```python
+  # 连续 6 次下载同一文件，统计成功次数；走的是系统代理，与游戏进程一致
+  ```
+
+  实测结论：`raw.githubusercontent.com` 1/6、`cdn.jsdelivr.net` 6/6。
+
 ### 排查「在线模块获取失败」
 
 - 仓库侧确认：仓库为 **Public**、默认分支根目录有 `TreeHouseModules.json`、清单 JSON 有效（`Publish-Check.ps1` 通过）。
-- 网络侧确认：Omni 从用户机器直接访问 GitHub（raw / API），国内网络直连经常失败；
-  让代理覆盖游戏进程（TUN / 系统代理）后手动刷新，或等 Omni 每 6 小时的自动刷新。
+- 网络侧确认：Omni 从用户机器访问清单与模块地址，国内网络访问 `raw.githubusercontent.com` 经常失败。
+  因此清单里的 `File` **改用 jsDelivr 直链**（`cdn.jsdelivr.net/gh/...`），实测同一台机器、同一代理下
+  `raw.githubusercontent.com` 6 次只成功 1 次，jsDelivr 6 次全成功。
+  清单本身仍用 raw 地址（只有几百字节，小文件成功率高），也可换成 jsDelivr，
+  但 jsDelivr 对分支文件有约 12 小时缓存，会导致清单更新延迟，故不推荐。
 - 沙箱/CI 环境若只有 `api.github.com` 可达而 `github.com` git 端口不通，
   可用 `gh api -X PUT repos/<owner>/<repo>/contents/<path>` 逐文件上传（大文件用 `--input` 请求体）。
