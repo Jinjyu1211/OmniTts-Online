@@ -1,0 +1,15 @@
+{
+  "SchemaVersion": 1,
+  "Modules": [
+    {
+      "InternalName": "TtsSystem",
+      "Name": "TTS 语音播报系统",
+      "Author": "Jinyu",
+      "Description": "统一的语音播报入口，支持 Edge TTS 与系统语音，供其他模块调用。",
+      "Version": "1.7.1",
+      "MinimumOmniVersion": "1.1.3.0",
+      "File": "Modules/TtsSystem.cs",
+      "Sha256": "350B8627F6F20CD53CD45012CB8D66AF5F49F1F660CC0D968CBDCCE53E71B754"
+    }
+  ]
+}
