@@ -70,6 +70,12 @@ foreach ($m in $manifest.Modules) {
     # 取 "@<ref>/" 之后的部分即可映射回仓库内的相对路径，从而照常做本地校验。
     $relativeFile = $m.File
     if ($relativeFile -match '^https?://') {
+        # 宿主硬性约束：Omni 校验下载地址时会抛
+        #   InvalidDataException: 清单和模块文件必须使用 GitHub raw HTTPS 地址。
+        # 也就是说 jsDelivr / 各类镜像一律会被拒，只有 raw.githubusercontent.com 可用。
+        if ($relativeFile -notmatch '^https://raw\.githubusercontent\.com/') {
+            Add-Error "$name：File 不是 GitHub raw 地址，Omni 会拒绝（必须是 https://raw.githubusercontent.com/...）"
+        }
         Add-Warning "$name：File 使用完整下载地址（校验的是其映射回仓库的本地副本）"
         if ($relativeFile -match '@[^/]+/(.+)$') {
             $relativeFile = $Matches[1]

@@ -302,21 +302,36 @@ pwsh -File Tools/Update-Sha256.ps1 -BumpVersion
   / `Received an unexpected EOF or 0 bytes from the transport stream`**：
   这是下载被掐断，几乎都是网络。同一时刻 Dalamud 的 `[PluginRepository]` 若也成片报
   `仓库数据获取失败`，即可确认是全局网络/代理抽风，而不是本仓库。
-- 定位时可直接对比两个下载源的成率，别只看单次能否打开网页：
+- **`InvalidDataException: 清单和模块文件必须使用 GitHub raw HTTPS 地址`**：
+  清单里的 `File` 被判为非法地址（CDN 直链、镜像、非 HTTPS 都会触发），改回相对路径即可。
+- 想确认到底是网络还是仓库，就对比「走代理」与「直连」的成率，别只看单次能否打开网页：
 
   ```python
-  # 连续 6 次下载同一文件，统计成功次数；走的是系统代理，与游戏进程一致
+  import urllib.request, time
+  u = "https://raw.githubusercontent.com/<owner>/<repo>/main/TreeHouseModules.json"
+  def run(op, n=6):
+      r = []
+      for _ in range(n):
+          try:
+              op.open(u, timeout=20).read(); r.append("OK")
+          except Exception as e:
+              r.append(type(e).__name__)
+          time.sleep(0.3)
+      return r
+  print("代理", run(urllib.request.build_opener()))
+  print("直连", run(urllib.request.build_opener(urllib.request.ProxyHandler({}))))
   ```
 
-  实测结论：`raw.githubusercontent.com` 1/6、`cdn.jsdelivr.net` 6/6。
+  曾实测到走代理 1/6、直连 6/6 —— 这种时候**关掉系统代理**反而装得上。
 
 ### 排查「在线模块获取失败」
 
 - 仓库侧确认：仓库为 **Public**、默认分支根目录有 `TreeHouseModules.json`、清单 JSON 有效（`Publish-Check.ps1` 通过）。
-- 网络侧确认：Omni 从用户机器访问清单与模块地址，国内网络访问 `raw.githubusercontent.com` 经常失败。
-  因此清单里的 `File` **改用 jsDelivr 直链**（`cdn.jsdelivr.net/gh/...`），实测同一台机器、同一代理下
-  `raw.githubusercontent.com` 6 次只成功 1 次，jsDelivr 6 次全成功。
-  清单本身仍用 raw 地址（只有几百字节，小文件成功率高），也可换成 jsDelivr，
-  但 jsDelivr 对分支文件有约 12 小时缓存，会导致清单更新延迟，故不推荐。
+- **宿主硬性约束：不能换 CDN。** Omni 校验下载地址时会抛
+  `InvalidDataException: 清单和模块文件必须使用 GitHub raw HTTPS 地址。`
+  实测填 jsDelivr 直链（`cdn.jsdelivr.net/gh/...`）必定被拒——哪怕它下载成功率更高
+  （同一台机器、同一代理下 `raw.githubusercontent.com` 曾 1/6、jsDelivr 6/6）。
+  所以 `File` **只能是相对路径或 `https://raw.githubusercontent.com/...`**，
+  能做的只有重试 / 换网络，而不是换域名。`Publish-Check.ps1` 已加该项校验。
 - 沙箱/CI 环境若只有 `api.github.com` 可达而 `github.com` git 端口不通，
   可用 `gh api -X PUT repos/<owner>/<repo>/contents/<path>` 逐文件上传（大文件用 `--input` 请求体）。
