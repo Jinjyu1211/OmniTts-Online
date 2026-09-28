@@ -9,7 +9,7 @@ Omni Toolbox（树树妙妙屋）在线模块：**TTS 语音播报系统**。
 插件设置 → 在线模块，填写仓库地址（或其 `TreeHouseModules.json` 的 raw 地址）：
 
 ```text
-https://github.com/<你的账号>/<你的仓库>
+https://github.com/Jinjyu1211/OmniTts-Online
 ```
 
 首次安装后模块默认关闭，在「树树妙妙屋 → 在线」中手动启用。
