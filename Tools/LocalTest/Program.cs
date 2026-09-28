@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Reflection;
 using OmniToolbox.TreeHouseOnline;
 
 // 本地测试入口，编译的是仓库里的 Modules/TtsSystem.cs 本体。
@@ -169,6 +170,7 @@ switch (cli[0].ToLowerInvariant())
         Console.WriteLine($"默认音色         : {module.Config.Voice}");
         Console.WriteLine($"引擎             : {module.Config.Engine}");
         Console.WriteLine($"音频格式         : {module.Config.AudioFormat}（0 自动 / 1 WAV / 2 MP3）");
+        Console.WriteLine($"IPC 状态         : {TtsIpc.Status}");
 
         if (Directory.Exists(TtsEdgeClient.CacheDirectory))
         {
@@ -177,9 +179,71 @@ switch (cli[0].ToLowerInvariant())
 
         return;
 
-    default:
-        Console.WriteLine("未知命令。可用：say / synth / diag / purge / info");
+    case "ipctest":
+        // 用鸭子类型的假插件接口验证 IPC 反射链路：泛型重载匹配、RegisterFunc/RegisterAction 传参、委托签名。
+        // 不触发真实播报，只检查端点能否被正确注册并调用。
+        RunIpcTest();
         return;
+
+    default:
+        Console.WriteLine("未知命令。可用：say / synth / diag / purge / info / ipctest");
+        return;
+}
+
+static void RunIpcTest()
+{
+    var ipcType = typeof(TtsIpc);
+    var getProvider = ipcType.GetMethod("GetProvider", BindingFlags.NonPublic | BindingFlags.Static);
+    var registerFunc = ipcType.GetMethod("RegisterFunc", BindingFlags.NonPublic | BindingFlags.Static);
+    var registerAction = ipcType.GetMethod("RegisterAction", BindingFlags.NonPublic | BindingFlags.Static);
+
+    if (getProvider is null || registerFunc is null || registerAction is null)
+    {
+        Console.WriteLine("失败：TtsIpc 的反射入口缺失");
+        return;
+    }
+
+    var fake = new FakePluginInterface();
+    var ok = true;
+
+    // Func<int>：OmniTts.Version
+    registerFunc.Invoke(null, [fake, new[] { typeof(int) }, "OmniTts.Version", (Func<int>)(() => TtsIpc.Version)]);
+    var versionProvider = fake.LastProvider as FakeIpcProvider<int>;
+    ok &= Report("Version 端点", versionProvider?.Func is not null && versionProvider!.Func!() == TtsIpc.Version);
+
+    // Func<string, bool>：OmniTts.Say（不调用，避免真实播报）
+    registerFunc.Invoke(null,
+        [fake, new[] { typeof(string), typeof(bool) }, "OmniTts.Say", (Func<string, bool>)(_ => true)]);
+    ok &= Report("Say 端点", (fake.LastProvider as FakeIpcProvider<string, bool>)?.Func is not null);
+
+    // Func<string, string, int, int, bool>：OmniTts.SayEx（不调用）
+    registerFunc.Invoke(null,
+    [
+        fake,
+        new[] { typeof(string), typeof(string), typeof(int), typeof(int), typeof(bool) },
+        "OmniTts.SayEx",
+        (Func<string, string, int, int, bool>)((_, _, _, _) => true),
+    ]);
+    ok &= Report("SayEx 端点",
+        (fake.LastProvider as FakeIpcProvider<string, string, int, int, bool>)?.Func is not null);
+
+    // Action：OmniTts.Stop
+    var stopped = false;
+    registerAction.Invoke(null, [fake, "OmniTts.Stop", (Action)(() => stopped = true)]);
+    var stopProvider = fake.LastProvider as FakeIpcProvider<object>;
+    stopProvider?.Action?.Invoke();
+    ok &= Report("Stop 端点（Action 可被回调）", stopped);
+
+    ok &= Report("端点名依次为 Version/Say/SayEx/Stop",
+        string.Join(",", fake.Names) == "OmniTts.Version,OmniTts.Say,OmniTts.SayEx,OmniTts.Stop");
+
+    Console.WriteLine(ok ? "IPC 反射链路：全部通过" : "IPC 反射链路：存在失败项");
+}
+
+static bool Report(string name, bool ok)
+{
+    Console.WriteLine($"  {name,-34} {(ok ? "通过" : "失败")}");
+    return ok;
 }
 
 static void Speak(TtsSystem module, string text, int waitSeconds)
@@ -261,4 +325,76 @@ internal static class NativeMci
         mciGetErrorString(code, sb, sb.Capacity);
         return sb.ToString();
     }
+}
+
+// ---- IPC 反射链路测试用的鸭子类型：只模拟 Dalamud 的 IPC 接口形状，不需要 Dalamud 运行时 ----
+
+internal sealed class FakePluginInterface
+{
+    public List<string> Names { get; } = [];
+
+    public object? LastProvider { get; private set; }
+
+    public FakeIpcProvider<TRet> GetIpcProvider<TRet>(string name) =>
+        Track(name, new FakeIpcProvider<TRet>());
+
+    public FakeIpcProvider<T1, TRet> GetIpcProvider<T1, TRet>(string name) =>
+        Track(name, new FakeIpcProvider<T1, TRet>());
+
+    public FakeIpcProvider<T1, T2, T3, T4, TRet> GetIpcProvider<T1, T2, T3, T4, TRet>(string name) =>
+        Track(name, new FakeIpcProvider<T1, T2, T3, T4, TRet>());
+
+    private T Track<T>(string name, T provider)
+    {
+        Names.Add(name);
+        LastProvider = provider;
+        return provider;
+    }
+}
+
+internal sealed class FakeIpcProvider<TRet>
+{
+    public Func<TRet>? Func { get; private set; }
+
+    public Action? Action { get; private set; }
+
+    public int UnregisterCalls { get; private set; }
+
+    public void RegisterFunc(Func<TRet> func) => Func = func;
+
+    public void RegisterAction(Action action) => Action = action;
+
+    public void UnregisterFunc() => UnregisterCalls++;
+
+    public void UnregisterAction() => UnregisterCalls++;
+}
+
+internal sealed class FakeIpcProvider<T1, TRet>
+{
+    public Func<T1, TRet>? Func { get; private set; }
+
+    public int UnregisterCalls { get; private set; }
+
+    public void RegisterFunc(Func<T1, TRet> func) => Func = func;
+
+    public void RegisterAction(Action action) => throw new NotSupportedException();
+
+    public void UnregisterFunc() => UnregisterCalls++;
+
+    public void UnregisterAction() => UnregisterCalls++;
+}
+
+internal sealed class FakeIpcProvider<T1, T2, T3, T4, TRet>
+{
+    public Func<T1, T2, T3, T4, TRet>? Func { get; private set; }
+
+    public int UnregisterCalls { get; private set; }
+
+    public void RegisterFunc(Func<T1, T2, T3, T4, TRet> func) => Func = func;
+
+    public void RegisterAction(Action action) => throw new NotSupportedException();
+
+    public void UnregisterFunc() => UnregisterCalls++;
+
+    public void UnregisterAction() => UnregisterCalls++;
 }
