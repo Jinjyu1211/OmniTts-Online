@@ -407,7 +407,7 @@ public sealed class TtsSystem : ModuleBase
             }
 
             var retries = config.EdgeRetries;
-            if (LabeledSliderInt("合成重试次数（失败后重建连接再试）", "##ttsRetries", ref retries, 0, 3))
+            if (LabeledSliderInt("合成重试次数（失败后重建连接再试）", "##ttsRetries", ref retries, 0, 5))
             {
                 config.EdgeRetries = retries;
                 dirty = true;
@@ -1384,7 +1384,7 @@ public static class TtsEdgeClient
         await SynthesisGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            var attempts = Math.Clamp(MaxRetries, 0, 3) + 1;
+            var attempts = Math.Clamp(MaxRetries, 0, 5) + 1;
             var budget = Stopwatch.StartNew();
             var isWav = !string.Equals(request.OutputFormat, "mp3", StringComparison.OrdinalIgnoreCase);
 
@@ -1679,8 +1679,36 @@ public static class TtsEdgeClient
     {
         Directory.CreateDirectory(CacheDirectory);
         var path = CachePath(request);
-        File.WriteAllBytes(path, audio);
+
+        // 先写临时文件再原子改名：直接写目标文件的话，一旦写入被打断就会留下半截音频，
+        // 之后每次命中这个坏缓存都是"播不出声音"，看起来就像 TTS 又坏了。
+        var temporary = $"{path}.{Guid.NewGuid():N}.tmp";
+        try
+        {
+            File.WriteAllBytes(temporary, audio);
+            File.Move(temporary, path, true);
+        }
+        finally
+        {
+            TryDeleteQuietly(temporary);
+        }
+
         return path;
+    }
+
+    private static void TryDeleteQuietly(string path)
+    {
+        try
+        {
+            if (File.Exists(path))
+            {
+                File.Delete(path);
+            }
+        }
+        catch
+        {
+            // 删除失败不影响播报。
+        }
     }
 
     public static string WriteTemp(TtsEdgeRequest request, byte[] audio)
@@ -1796,7 +1824,6 @@ public static class TtsEdgeClient
         using var audio = new MemoryStream();
         var receiveBuffer = new byte[BufferSize];
         var messageBuffer = new List<byte>();
-        var streaming = false;
 
         while (!token.IsCancellationRequested)
         {
@@ -1818,12 +1845,16 @@ public static class TtsEdgeClient
             if (result.MessageType == WebSocketMessageType.Text)
             {
                 var message = Encoding.UTF8.GetString(receiveBuffer, 0, result.Count);
-                if (message.Contains(requestId, StringComparison.Ordinal) && message.Contains("Path:turn.start", StringComparison.Ordinal))
+                if (message.Contains("Path:turn.end", StringComparison.Ordinal))
                 {
-                    streaming = true;
-                }
-                else if (streaming && message.Contains("Path:turn.end", StringComparison.Ordinal))
-                {
+                    // 服务端拒绝请求（无效音色、限流等）时会直接回 turn.end 而不下发音频。
+                    // 这种情况必须立刻结束本轮让上层重试，否则会一直空转到超时才失败。
+                    if (audio.Length == 0)
+                    {
+                        TtsSystem.LogEdge("收到 turn.end 但没有任何音频，服务端拒绝了本次请求");
+                        return null;
+                    }
+
                     return audio.ToArray();
                 }
 
@@ -1858,7 +1889,6 @@ public static class TtsEdgeClient
             }
 
             await audio.WriteAsync(data.AsMemory(2 + headerLength), token).ConfigureAwait(false);
-            streaming = true;
         }
 
         return audio.Length > 0 ? audio.ToArray() : null;
@@ -2459,7 +2489,7 @@ public sealed class TtsSystemConfig
     /// 单次播报的合成重试次数（不含首次尝试），0 表示不重试。
     /// 免费端点会限流与被静默断连，重试能显著提高成功率；冷却期内不会重试。
     /// </summary>
-    public int EdgeRetries { get; set; } = 2;
+    public int EdgeRetries { get; set; } = 3;
 
     /// <summary>发音替换表，用于修正游戏专有名词的读法。</summary>
     public Dictionary<string, string> PhonemeReplacements { get; set; } = new()
