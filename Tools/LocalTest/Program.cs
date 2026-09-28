@@ -159,6 +159,81 @@ switch (cli[0].ToLowerInvariant())
         return;
     }
 
+    case "failtest":
+    {
+        // 用不存在的音色注入失败，验证「重试 → 连续失败计数 → 冷却 → 重置」整条链路。
+        Console.WriteLine("=== 失败链路测试（无效音色，故意让服务端拒绝）===");
+        TtsEdgeClient.ResetHealth();
+        for (var i = 0; i < 3; i++)
+        {
+            var bad = new TtsEdgeRequest
+            {
+                Text = $"失败测试 {i + 1}",
+                Voice = "xx-XX-NotExistNeural",
+                OutputFormat = "mp3",
+            };
+
+            var sw = Stopwatch.StartNew();
+            var audio = TtsEdgeClient.SynthesizeAsync(bad).GetAwaiter().GetResult();
+            sw.Stop();
+            Console.WriteLine($"  #{i + 1} {sw.ElapsedMilliseconds,6} ms  结果={(audio is { Length: > 0 } ? "成功" : "失败")}  " +
+                              $"连续失败={TtsEdgeClient.ConsecutiveFailures} 冷却={TtsEdgeClient.CooldownRemainingSeconds}s");
+        }
+
+        Console.WriteLine("冷却期内再合成一次（应立即返回、不打网络）：");
+        var sw2 = Stopwatch.StartNew();
+        var quick = TtsEdgeClient.SynthesizeAsync(new TtsEdgeRequest
+        {
+            Text = "冷却验证",
+            Voice = module.Config.Voice,
+            OutputFormat = "mp3",
+        }).GetAwaiter().GetResult();
+        sw2.Stop();
+        Console.WriteLine($"  {sw2.ElapsedMilliseconds} ms  结果={(quick is { Length: > 0 } ? "成功" : "失败（符合预期）")}");
+
+        TtsEdgeClient.ResetHealth();
+        Console.WriteLine($"重置后：连续失败={TtsEdgeClient.ConsecutiveFailures} 冷却={TtsEdgeClient.CooldownRemainingSeconds}s");
+        TtsEdgeClient.CloseConnection();
+        return;
+    }
+
+    case "stress":
+    {
+        // 连续合成大量不同文本，观察限流何时出现、重试能否救回、冷却是否生效。
+        var count = cli.Length > 1 && int.TryParse(cli[1], out var c) ? c : 12;
+        Console.WriteLine($"=== 连续合成压力测试（{count} 段不同文本，重试={module.Config.EdgeRetries}）===");
+        var ok = 0;
+        for (var i = 0; i < count; i++)
+        {
+            var request = new TtsEdgeRequest
+            {
+                Text = $"压力测试第 {2001 + i} 句",
+                Voice = module.Config.Voice,
+                OutputFormat = "mp3",
+            };
+
+            var sw = Stopwatch.StartNew();
+            var audio = TtsEdgeClient.SynthesizeAsync(request).GetAwaiter().GetResult();
+            sw.Stop();
+            var good = audio is { Length: > 0 };
+            if (good) ok++;
+            Console.WriteLine($"  #{i + 1,2} {sw.ElapsedMilliseconds,6} ms  {audio?.Length ?? 0,7} 字节  " +
+                              $"{(good ? "OK" : "失败")}  连续失败={TtsEdgeClient.ConsecutiveFailures} 冷却={TtsEdgeClient.CooldownRemainingSeconds}s");
+            if (TtsEdgeClient.CooldownRemainingSeconds > 0)
+            {
+                Console.WriteLine("  → 已进入限流冷却，停止压测");
+                break;
+            }
+        }
+
+        Console.WriteLine($"成功 {ok}/{count}");
+        Console.WriteLine($"重置后冷却      : ");
+        TtsEdgeClient.ResetHealth();
+        Console.WriteLine($"  冷却={TtsEdgeClient.CooldownRemainingSeconds}s 连续失败={TtsEdgeClient.ConsecutiveFailures}");
+        TtsEdgeClient.CloseConnection();
+        return;
+    }
+
     case "purge":
         Console.WriteLine($"已清除 {module.PurgeCache()} 个缓存文件");
         return;
