@@ -42,6 +42,23 @@ if (MyTtsBridge.Available)
 
 > 辅助类型重名会造成加载冲突，复制后务必改名。
 
+### Dalamud IPC（给任意 Dalamud 插件，推荐）
+
+`TtsIpc` 在 `OnEnable` 时注册六个端点（`OmniTts.Version / IsAvailable / Say / SayEx / Stop / ClearQueue`），
+`OnDispose` 时全部注销。实现全程反射，只用到宿主提供的 `OmniToolbox.Host.DalamudServices.PluginInterface`，
+不新增 Dalamud.dll 的编译期引用，因此不违反在线模块的依赖约束。
+
+几个关键点：
+
+- `GetIpcProvider` 有多个泛型重载，按**泛型参数个数**匹配；返回类型是最后一个泛型参数。
+- 注册前先调一次 `UnregisterFunc` / `UnregisterAction`：在线模块重载会产生新的动态程序集，
+  旧程序集注册的端点可能残留，先注销再注册可避免重名冲突。
+- 委托实例要存进静态列表保活，否则可能被 GC 回收导致调用失效。
+- `RegisterAction` 用 `GetIpcProvider<object>(name)` 承载 `Action`。
+
+订阅方写法与端点契约见 [CALLERS.md](CALLERS.md)。
+本地可用 `OmniTtsLocalTest ipctest` 验证反射链路（用鸭子类型的假插件接口，不需要 Dalamud 运行时）。
+
 ## 配置项
 
 | 配置 | 说明 | 默认值 |
