@@ -1,0 +1,54 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    本地测试工程：直接编译仓库里的 Modules/TtsSystem.cs（不是副本）。
+
+    引用的是本机 Omni / Dalamud 的**真实程序集**（不是桩类型），因此本地编译结果与
+    Omni 宿主在线编译结果一致，能提前暴露 ImGui / ModuleBase 的签名差异。
+    若不希望依赖本机路径，可把 $(OmniDir) / $(DalamudHooksDir) 覆盖为其它位置。
+    用法见 Program.cs 顶部注释。
+  -->
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <AssemblyName>OmniTtsLocalTest</AssemblyName>
+    <RootNamespace>OmniTtsLocalTest</RootNamespace>
+    <NoWarn>CA1416</NoWarn>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <DalamudHooksDir Condition="'$(DalamudHooksDir)' == ''">$(AppData)\XIVLauncherCN\addon\Hooks\dev</DalamudHooksDir>
+    <OmniDir Condition="'$(OmniDir)' == ''">$(AppData)\XIVLauncherCN\installedPlugins\OmniToolbox\1.1.5.6</OmniDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+    <Compile Include="..\..\Modules\TtsSystem.cs" />
+  </ItemGroup>
+
+  <!-- 真实 API，用于验证签名；缺失时会编译失败并提示路径。 -->
+  <ItemGroup>
+    <Reference Include="OmniToolbox.Common">
+      <HintPath>$(OmniDir)\OmniToolbox.Common.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="Dalamud.Bindings.ImGui">
+      <HintPath>$(DalamudHooksDir)\Dalamud.Bindings.ImGui.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="Dalamud.Common">
+      <HintPath>$(DalamudHooksDir)\Dalamud.Common.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="NAudio" Version="2.2.1" />
+  </ItemGroup>
+
+</Project>
