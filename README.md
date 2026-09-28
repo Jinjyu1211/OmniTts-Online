@@ -32,11 +32,11 @@ https://github.com/Jinjyu1211/OmniTts-Online
 /omni TtsSystem say 副本即将开始
 /omni TtsSystem stop
 /omni TtsSystem clear
-/omni TtsSystem test
 /omni TtsSystem purge
 ```
 
 `say` 后面所有内容都会作为文本播报，不需要引号。
+`test` 仍可用，是「朗读快捷播报文本」的别名（不再有独立的测试文本）。
 
 ### 2. 静态调用（同一个仓库内的其他模块）
 
@@ -83,7 +83,7 @@ if (MyTtsBridge.Available)
 | `CacheAudio` | 缓存合成音频 | `true` |
 | `FallbackToSapi` | Edge 失败时回退系统语音 | `true` |
 | `PhonemeReplacements` | 发音替换表，默认含「欧米茄→欧米加」等 | 见代码 |
-| `TestText` | `test` 命令与试听按钮使用的文本 | `语音测试` |
+| `TestText` | 已移除：测试播报统一使用 `HotkeyText`（快捷播报文本） | — |
 | `HotkeyText` | 设置页命令列表中「播报文本」执行按钮读的内容 | `副本即将开始` |
 
 ## 命令执行按钮
@@ -147,7 +147,7 @@ if (MyTtsBridge.Available)
 | 手段 | 效果 |
 | --- | --- |
 | **WebSocket 连接复用** | 单次握手约 0.7–1.3 秒，占冷启动耗时一半以上。服务端允许同一条连接连续合成多条（重发 `speech.config` 即可），因此连接建好后保留复用，直到 240 秒未被使用才重建。 |
-| **启用时预热** | `OnEnable` 后台建立连接，并可把常用文本（快捷播报文本、测试文本）提前合成进缓存，让首次触发也几乎不用等握手。 |
+| **启用时预热** | `OnEnable` 后台建立连接，并把快捷播报文本提前合成进缓存，让首次触发也几乎不用等握手。 |
 | **结果缓存** | 相同文本+音色+语速+音调+音量+格式直接读缓存文件，通常几十毫秒出声；可在设置里关闭，或用 `purge` 命令清除。 |
 
 本机实测（短句、MP3、同一服务节点）：
