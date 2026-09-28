@@ -6,10 +6,10 @@
       "Name": "TTS 语音播报系统",
       "Author": "Jinyu",
       "Description": "统一的语音播报入口，支持 Edge TTS 与系统语音，供其他模块调用。",
-      "Version": "1.8.0",
+      "Version": "1.9.0",
       "MinimumOmniVersion": "1.1.3.0",
       "File": "Modules/TtsSystem.cs",
-      "Sha256": "27C4CC6B9723A3F07227282B0D44216B9C26B22E23D2FBEB1AAF757193931C9E"
+      "Sha256": "B9CC2E244BC5BAAB39FC224B6FF15D54E80D48F7518B27138951CAA65DB72187"
     }
   ]
 }
