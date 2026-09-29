@@ -49,6 +49,13 @@ foreach ($module in $manifest.Modules) {
         throw "找不到模块文件：$currentFile"
     }
 
+    # 开发源文件优先：清单里的 File 指向上一版快照，直接用它会导致升版本时
+    # 复制旧内容、摘要永远不变。只要 Modules/<name>.cs 存在，就以它为准。
+    $devFile = Join-Path $root ("Modules\{0}" -f [System.IO.Path]::GetFileName($relative))
+    if (Test-Path -LiteralPath $devFile) {
+        $currentFile = $devFile
+    }
+
     if ($BumpVersion) {
         $parts = $oldVersion.Split('.')
         $parts[$parts.Length - 1] = [string]([int]$parts[$parts.Length - 1] + 1)
