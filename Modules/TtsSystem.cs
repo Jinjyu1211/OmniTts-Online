@@ -641,6 +641,10 @@ public sealed class TtsSystem : ModuleBase
                 return;
             }
 
+            // 新一条播报开始时清除上一次 Stop/Interrupt 留下的中止标记，
+            // 否则该标记一旦置位将永久拦截后续所有播报（表现为"合成失败"且无网络请求）。
+            abortCurrent = false;
+
             statusText = $"播报中：{text}";
             SpeakNow(text);
         }
