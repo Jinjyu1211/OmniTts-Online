@@ -25,6 +25,8 @@
     <DalamudHooksDir Condition="'$(DalamudHooksDir)' == ''">$(AppData)\XIVLauncherCN\addon\Hooks\dev</DalamudHooksDir>
     <!-- Omni 升级会换目录名，这里按新到旧逐个探测，也可直接用 -p:OmniDir=... 指定。 -->
     <OmniRoot>$(AppData)\XIVLauncherCN\installedPlugins\OmniToolbox</OmniRoot>
+    <OmniDir Condition="'$(OmniDir)' == '' And Exists('$(OmniRoot)\1.1.6.0\OmniToolbox.Common.dll')">$(OmniRoot)\1.1.6.0</OmniDir>
+    <OmniDir Condition="'$(OmniDir)' == '' And Exists('$(OmniRoot)\1.1.5.9\OmniToolbox.Common.dll')">$(OmniRoot)\1.1.5.9</OmniDir>
     <OmniDir Condition="'$(OmniDir)' == '' And Exists('$(OmniRoot)\1.1.5.7\OmniToolbox.Common.dll')">$(OmniRoot)\1.1.5.7</OmniDir>
     <OmniDir Condition="'$(OmniDir)' == '' And Exists('$(OmniRoot)\1.1.5.6\OmniToolbox.Common.dll')">$(OmniRoot)\1.1.5.6</OmniDir>
     <OmniDir Condition="'$(OmniDir)' == ''">$(OmniRoot)\1.1.5.7</OmniDir>
