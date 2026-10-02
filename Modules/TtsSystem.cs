@@ -45,6 +45,7 @@ public sealed class TtsSystem : ModuleBase
         ("清空队列", "/omni TtsSystem clear"),
         ("清除音频缓存", "/omni TtsSystem purge"),
         ("重置网络连接", "/omni TtsSystem reset"),
+        ("删除诊断日志", "/omni TtsSystem clearlog"),
     ];
 
     private TtsSystemConfig config = new();
@@ -76,6 +77,7 @@ public sealed class TtsSystem : ModuleBase
     protected override void OnEnable()
     {
         Instance = this;
+        SyncLogPath();
         TtsIpc.Register();
         PreheatAsync();
         base.OnEnable();
@@ -93,8 +95,15 @@ public sealed class TtsSystem : ModuleBase
     public TtsSystemConfig Config
     {
         get => config;
-        set => config = value ?? new TtsSystemConfig();
+        set
+        {
+            config = value ?? new TtsSystemConfig();
+            SyncLogPath();
+        }
     }
+
+    /// <summary>把配置里的日志路径同步给日志写入端。</summary>
+    private void SyncLogPath() => TtsEdgeClient.CustomLogFile = config.LogPath;
 
     // ---------- 对外调用入口 ----------
 
@@ -269,6 +278,11 @@ public sealed class TtsSystem : ModuleBase
                 TtsEdgeClient.ResetHealth();
                 statusText = "已重置 Edge 连接与限流冷却";
                 PreheatAsync();
+                return true;
+
+            case "clearlog":
+            case "logclear":
+                DeleteLog();
                 return true;
 
             case "test":
@@ -505,7 +519,32 @@ public sealed class TtsSystem : ModuleBase
             ? $"Edge：连续失败 {TtsEdgeClient.ConsecutiveFailures} 次，限流冷却剩余 {cooling}s（点上方“重置网络连接”提前恢复）"
             : $"Edge：连接正常，连续失败 {TtsEdgeClient.ConsecutiveFailures} 次");
 
-        ImGui.TextUnformatted($"日志：{TtsEdgeClient.LogFilePath}");
+        ImGui.Separator();
+
+        var logPath = config.LogPath ?? string.Empty;
+        if (LabeledInputText(
+                "日志文件路径（留空 = 默认缓存目录；填目录自动拼接 tts.log，可改到 D/E 盘避开系统盘）",
+                "##ttsLogPath", ref logPath, 512))
+        {
+            config.LogPath = string.IsNullOrWhiteSpace(logPath) ? null : logPath.Trim();
+            SyncLogPath();
+            dirty = true;
+        }
+
+        if (ImGui.Button("恢复默认路径##ttsLogReset"))
+        {
+            config.LogPath = null;
+            SyncLogPath();
+            dirty = true;
+        }
+
+        ImGui.SameLine();
+        if (ImGui.Button("删除日志##ttsLogDelete"))
+        {
+            DeleteLog();
+        }
+
+        ImGui.TextUnformatted($"当前日志：{TtsEdgeClient.LogFilePath}");
 
         return dirty;
     }
@@ -551,6 +590,7 @@ public sealed class TtsSystem : ModuleBase
                 statusText = "已重置 Edge 连接与限流冷却";
                 PreheatAsync();
                 break;
+            case 5: DeleteLog(); break;
         }
     }
 
@@ -904,10 +944,10 @@ public sealed class TtsSystem : ModuleBase
 
     /// <summary>
     /// 诊断日志：把游戏进程内的合成/播放结果落盘，供排查 Omni 环境下的失败原因。
-    /// 文件位于 %TEMP%\OmniTtsCache\tts.log，失败不影响播报。
+    /// 默认位于 %TEMP%\OmniTtsCache\tts.log，可在设置页改为其他盘符；失败不影响播报。
     /// </summary>
     internal static readonly object LogGate = new();
-    private static bool logDirectoryReady;
+    private static string? logDirectoryCreated;
 
     internal static void LogEdge(string message)
     {
@@ -915,20 +955,46 @@ public sealed class TtsSystem : ModuleBase
         {
             lock (LogGate)
             {
-                if (!logDirectoryReady)
+                var logPath = TtsEdgeClient.LogFilePath;
+                var dir = Path.GetDirectoryName(logPath);
+                if (dir is not null
+                    && !string.Equals(logDirectoryCreated, dir, StringComparison.OrdinalIgnoreCase))
                 {
-                    Directory.CreateDirectory(TtsEdgeClient.CacheDirectory);
-                    logDirectoryReady = true;
+                    Directory.CreateDirectory(dir);
+                    logDirectoryCreated = dir;
                 }
 
                 File.AppendAllText(
-                    TtsEdgeClient.LogFilePath,
+                    logPath,
                     $"{DateTime.Now:HH:mm:ss.fff} {message}{Environment.NewLine}");
             }
         }
         catch
         {
             // 日志写入失败不影响播报。
+        }
+    }
+
+    /// <summary>删除诊断日志文件。文件不存在也视为成功。返回是否删除成功。</summary>
+    public bool DeleteLog()
+    {
+        try
+        {
+            lock (LogGate)
+            {
+                if (File.Exists(TtsEdgeClient.LogFilePath))
+                {
+                    File.Delete(TtsEdgeClient.LogFilePath);
+                }
+            }
+
+            statusText = "诊断日志已删除";
+            return true;
+        }
+        catch (Exception ex)
+        {
+            statusText = $"删除日志失败：{ex.Message}";
+            return false;
         }
     }
 
@@ -1251,8 +1317,39 @@ public static class TtsEdgeClient
     private static Type? cachedReaderType;
     private static Type? cachedWaveOutType;
 
-    /// <summary>诊断日志路径，界面与日志写入共用同一份。</summary>
-    public static string LogFilePath => Path.Combine(CacheDirectory, "tts.log");
+    /// <summary>默认诊断日志路径：%TEMP%\OmniTtsCache\tts.log。</summary>
+    public static string DefaultLogFilePath => Path.Combine(CacheDirectory, "tts.log");
+
+    private static string? customLogFile;
+
+    /// <summary>
+    /// 自定义诊断日志路径，null 表示使用默认位置。写入前会做归一化：
+    /// 以分隔符结尾、目录已存在或无扩展名时视为目录，自动拼接 tts.log。
+    /// </summary>
+    public static string? CustomLogFile
+    {
+        get => customLogFile;
+        set => customLogFile = string.IsNullOrWhiteSpace(value) ? null : NormalizeLogPath(value.Trim());
+    }
+
+    /// <summary>当前生效的日志路径，界面与日志写入共用同一份。</summary>
+    public static string LogFilePath => customLogFile ?? DefaultLogFilePath;
+
+    private static string NormalizeLogPath(string value)
+    {
+        try
+        {
+            var looksLikeDirectory = value.EndsWith('\\') || value.EndsWith('/')
+                || Directory.Exists(value)
+                || string.Equals(Path.GetExtension(value), string.Empty, StringComparison.Ordinal);
+            return looksLikeDirectory ? Path.Combine(value, "tts.log") : value;
+        }
+        catch
+        {
+            // 目录探测失败时按原样当文件路径用，写入失败也不影响播报。
+            return value;
+        }
+    }
 
     /// <summary>
     /// 遍历已加载程序集查找 NAudio 类型并按兼容性配对。
@@ -2506,6 +2603,12 @@ public sealed class TtsSystemConfig
 
     public string CustomExecutable { get; set; } = string.Empty;
     public string CustomArguments { get; set; } = "{text}";
+
+    /// <summary>
+    /// 诊断日志文件路径。空 = 默认 %TEMP%\OmniTtsCache\tts.log；
+    /// 填目录（以分隔符结尾或无扩展名）时自动拼接 tts.log。
+    /// </summary>
+    public string? LogPath { get; set; }
 
     /// <summary>快捷播报文本：设置页命令列表中“播报文本”的执行按钮读这一句。</summary>
     public string HotkeyText { get; set; } = "副本即将开始";
